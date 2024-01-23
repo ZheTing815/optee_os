@@ -20,10 +20,10 @@ void wq_init(struct wait_queue *wq)
 	*wq = (struct wait_queue)WAIT_QUEUE_INITIALIZER;
 }
 
-static void do_notif(TEE_Result (*fn)(uint32_t), int id,
-		     const char *cmd_str __maybe_unused,
-		     const void *sync_obj __maybe_unused,
-		     const char *fname, int lineno __maybe_unused)
+static TEE_Result do_notif(bool sleep, int id, uint32_t timeout_ms,
+			   const char *cmd_str __maybe_unused,
+			   const void *sync_obj __maybe_unused,
+			   const char *fname, int lineno __maybe_unused)
 {
 	TEE_Result res = TEE_SUCCESS;
 
@@ -33,9 +33,15 @@ static void do_notif(TEE_Result (*fn)(uint32_t), int id,
 	else
 		DMSG("%s thread %d %p", cmd_str, id, sync_obj);
 
-	res = fn(id + NOTIF_SYNC_VALUE_BASE);
+	if (sleep)
+		res = notif_wait_timeout(id + NOTIF_SYNC_VALUE_BASE,
+					 timeout_ms);
+	else
+		res = notif_send_sync(id + NOTIF_SYNC_VALUE_BASE);
 	if (res)
 		DMSG("%s thread %d res %#"PRIx32, cmd_str, id, res);
+
+	return res;
 }
 
 static void slist_add_tail(struct wait_queue *wq, struct wait_queue_elem *wqe)
@@ -69,17 +75,24 @@ void wq_wait_init_condvar(struct wait_queue *wq, struct wait_queue_elem *wqe,
 	cpu_spin_unlock_xrestore(&wq_spin_lock, old_itr_status);
 }
 
-void wq_wait_final(struct wait_queue *wq, struct wait_queue_elem *wqe,
-		   const void *sync_obj, const char *fname, int lineno)
+static TEE_Result wq_wait_final_helper(struct wait_queue *wq,
+				       struct wait_queue_elem *wqe,
+				       uint32_t timeout_ms,
+				       const void *sync_obj, const char *fname,
+				       int lineno)
 {
-	uint32_t old_itr_status;
-	unsigned done;
+	TEE_Result res = TEE_SUCCESS;
+	uint32_t old_itr_status = 0;
+	bool done = false;
 
 	do {
-		do_notif(notif_wait, wqe->handle,
-			 "sleep", sync_obj, fname, lineno);
+		res = do_notif(true, wqe->handle, timeout_ms,
+			       "sleep", sync_obj, fname, lineno);
 
 		old_itr_status = cpu_spin_lock_xsave(&wq_spin_lock);
+
+		if (res == TEE_SUCCESS || res == TEE_ERROR_TIMEOUT)
+			wqe->done = true;
 
 		done = wqe->done;
 		if (done)
@@ -87,6 +100,23 @@ void wq_wait_final(struct wait_queue *wq, struct wait_queue_elem *wqe,
 
 		cpu_spin_unlock_xrestore(&wq_spin_lock, old_itr_status);
 	} while (!done);
+
+	return res;
+}
+
+void wq_wait_final(struct wait_queue *wq, struct wait_queue_elem *wqe,
+		   const void *sync_obj, const char *fname, int lineno)
+{
+	wq_wait_final_helper(wq, wqe, 0, sync_obj, fname, lineno);
+}
+
+TEE_Result wq_wait_final_timeout(struct wait_queue *wq,
+				 struct wait_queue_elem *wqe,
+				 uint32_t timeout_ms, const void *sync_obj,
+				 const char *fname, int lineno)
+{
+	return wq_wait_final_helper(wq, wqe, timeout_ms, sync_obj, fname,
+				    lineno);
 }
 
 void wq_wake_next(struct wait_queue *wq, const void *sync_obj,
@@ -130,7 +160,7 @@ void wq_wake_next(struct wait_queue *wq, const void *sync_obj,
 		cpu_spin_unlock_xrestore(&wq_spin_lock, old_itr_status);
 
 		if (do_wakeup)
-			do_notif(notif_send_sync, handle,
+			do_notif(false, handle, 0,
 				 "wake ", sync_obj, fname, lineno);
 
 		if (!do_wakeup || !wake_read)
